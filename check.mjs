@@ -31,13 +31,16 @@ function classify(info) {
   if (!sig.trim()) return "empty"; // 표시 없음: 알림 없이 로그만 남김
   if (/[×✕✖╳]|closed|holiday|close\b/.test(sig)) return "closed";
   if (/[—–−－ー]|(^|\s)-(\s|$)|sold|dash|minus|none|\bng\b|full|unavail/.test(sig)) return "soldout";
-  if (/[○◯〇]|avail|vacan|circle|\bok\b|\bopen\b|stock|reserve/.test(sig)) return "available";
+  if (/[○◯〇]|avail|vacan|circle|\bok\b|\bopen\b|stock|reserve|\bsale\b/.test(sig)) return "available";
   return "unknown";
 }
 
 async function readDay(page, aria) {
   return page.evaluate((aria) => {
-    const a = document.querySelector(`a[aria-label="${aria}"]`);
+    // 인접 달의 흐린 칸(fc-day-other)은 같은 날짜가 중복되므로 제외
+    const a = [...document.querySelectorAll(`a[aria-label="${aria}"]`)].find(
+      (e) => !e.closest("td")?.classList.contains("fc-day-other"),
+    );
     if (!a) return null;
     const cell = a.closest("td") || a.parentElement;
     const ev = cell.querySelector(".fc-daygrid-day-events") || cell;
@@ -57,7 +60,7 @@ async function readDay(page, aria) {
 }
 
 async function gotoMonth(page, t) {
-  const sel = `a[aria-label="${t.aria}"]`;
+  const sel = `td.fc-day:not(.fc-day-other) a[aria-label="${t.aria}"]`;
   if (await page.locator(sel).count()) return;
   const strategies = [
     () => page.getByText(new RegExp(`^\\s*${t.tab}\\b`)).first().click(),
@@ -91,7 +94,7 @@ try {
     await gotoMonth(page, t);
     await page.waitForSelector(".fc-daygrid-event", { timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(1500);
-    const month = await page.$$eval("td.fc-day", (tds) =>
+    const month = await page.$$eval("td.fc-day:not(.fc-day-other)", (tds) =>
       tds.map((td) => {
         const lab = td.querySelector("a[aria-label]")?.getAttribute("aria-label") ?? "?";
         const toks = [...td.querySelectorAll(".fc-daygrid-day-events *")]
