@@ -82,58 +82,73 @@ async function gotoMonth(page, t) {
   throw new Error(`${t.tab} 탭 전환 실패. 현재 표시 중인 날짜 예: ${labels.join(" | ")}`);
 }
 
+const LOOP_MINUTES = Number(process.env.LOOP_MINUTES || 0); // 0이면 1회만 확인
+const INTERVAL_MIN = Number(process.env.INTERVAL_MINUTES || 5);
+const kst = () => new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
+
 const browser = await chromium.launch();
-const page = await (await browser.newContext({ locale: "en-US", viewport: { width: 430, height: 1200 } })).newPage();
-let failed = false;
+const context = await browser.newContext({ locale: "en-US", viewport: { width: 430, height: 1200 } });
 
-try {
-  await page.goto(URL, { waitUntil: "networkidle", timeout: 60000 });
-  const alerts = [];
-  const rows = [];
+async function checkOnce(first) {
+  const page = await context.newPage();
+  try {
+    await page.goto(URL, { waitUntil: "networkidle", timeout: 60000 });
+    const alerts = [];
+    const rows = [];
 
-  for (const t of TARGETS) {
-    await gotoMonth(page, t);
-    await page.waitForSelector(".fc-daygrid-event", { timeout: 10000 }).catch(() => {});
-    await page.waitForTimeout(1500);
-    const month = await page.$$eval("td.fc-day:not(.fc-day-other)", (tds) =>
-      tds.map((td) => {
-        const lab = td.querySelector("a[aria-label]")?.getAttribute("aria-label") ?? "?";
-        const toks = [...td.querySelectorAll(".fc-daygrid-day-events *")]
-          .flatMap((e) => String(e.className?.baseVal ?? e.className ?? "").split(/\s+/))
-          .filter((c) => c && !c.startsWith("fc-"));
-        return `${lab.replace(/, \d{4}$/, "")}=${[...new Set(toks)].join("+") || "-"}`;
-      }),
-    );
-    console.log(`[${t.tab} 전체] ${month.join(" | ")}`);
-    await page.screenshot({ path: `debug/${t.tab}.png`, fullPage: true });
-    writeFileSync(`debug/${t.tab}.html`, await page.content());
+    for (const t of TARGETS) {
+      await gotoMonth(page, t);
+      await page.waitForSelector(".fc-daygrid-event", { timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+      if (first) {
+        await page.screenshot({ path: `debug/${t.tab}.png`, fullPage: true });
+        writeFileSync(`debug/${t.tab}.html`, await page.content());
+      }
+      const info = await readDay(page, t.aria);
+      if (!info) throw new Error(`${t.aria} 셀을 찾지 못함 (debug/ 확인)`);
+      const status = classify(info);
+      rows.push(`${t.label}=${status}`);
+      if (status !== "soldout") console.log(`  ${t.label} tokens=${JSON.stringify(info.tokens)} text=${JSON.stringify(info.text)} html=${info.html}`);
+      if (status === "available") alerts.push(`${t.label} 예약 가능!`);
+      else if (status === "unknown") alerts.push(`${t.label} 상태 변화 감지(확인 필요): ${info.text.replace(/\s+/g, " ") || info.tokens.join(",")}`);
+    }
 
-    const info = await readDay(page, t.aria);
-    if (!info) throw new Error(`${t.aria} 셀을 찾지 못함 (debug/ 확인)`);
-    const status = classify(info);
-    rows.push(`| ${t.label} | ${status} |`);
-    console.log(`${t.label} [${t.aria}] => ${status}`);
-    console.log(`  tokens=${JSON.stringify(info.tokens)} text=${JSON.stringify(info.text)} alts=${JSON.stringify(info.alts)} href=${info.hasHref}`);
-    console.log(`  html=${info.html}`);
-    if (status === "available") alerts.push(`${t.label} 예약 가능!`);
-    else if (status === "unknown") alerts.push(`${t.label} 상태 변화 감지(확인 필요): ${info.text.replace(/\s+/g, " ") || info.tokens.join(",")}`);
+    console.log(`[${kst()}] ${rows.join("  ")}`);
+    if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `- ${kst()} (KST): ${rows.join(", ")}\n`);
+    if (first && process.env.TEST_NOTIFY === "true") await notify("Nintendo Museum test", "테스트 알림입니다");
+    if (alerts.length) await notify("Nintendo Museum ticket!", alerts.join("\n"), "urgent", "tada,ticket");
+  } catch (e) {
+    await page.screenshot({ path: "debug/error.png", fullPage: true }).catch(() => {});
+    throw e;
+  } finally {
+    await page.close();
   }
-
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    const kst = new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
-    appendFileSync(
-      process.env.GITHUB_STEP_SUMMARY,
-      `### 확인 시각: ${kst} (KST)\n\n| 날짜 | 상태 |\n|---|---|\n${rows.join("\n")}\n`,
-    );
-  }
-
-  if (process.env.TEST_NOTIFY === "true") await notify("Nintendo Museum test", "테스트 알림입니다");
-  if (alerts.length) await notify("Nintendo Museum ticket!", alerts.join("\n"), "urgent", "tada,ticket");
-} catch (e) {
-  failed = true;
-  console.error(e);
-  await page.screenshot({ path: "debug/error.png", fullPage: true }).catch(() => {});
-} finally {
-  await browser.close();
 }
-process.exit(failed ? 1 : 0);
+
+const deadline = Date.now() + LOOP_MINUTES * 60_000;
+let failures = 0;
+let first = true;
+let exitCode = 0;
+
+while (true) {
+  const started = Date.now();
+  try {
+    await checkOnce(first);
+    failures = 0;
+  } catch (e) {
+    failures++;
+    console.error(`[${kst()}] 확인 실패 (${failures}회 연속):`, e);
+    if (failures >= 3 || !LOOP_MINUTES) {
+      await notify("Nintendo Museum checker failing", String(e.message).slice(0, 200), "high", "warning").catch(() => {});
+      exitCode = 1;
+      break;
+    }
+  }
+  first = false;
+  const next = started + INTERVAL_MIN * 60_000;
+  if (!LOOP_MINUTES || next >= deadline) break;
+  await new Promise((r) => setTimeout(r, Math.max(0, next - Date.now())));
+}
+
+await browser.close();
+process.exit(exitCode);
