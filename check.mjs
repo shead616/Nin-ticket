@@ -1,6 +1,6 @@
 // Nintendo Museum 티켓 캘린더에서 지정 날짜가 "○"(예약 가능)로 바뀌었는지 확인하고 ntfy로 알림을 보낸다.
 import { chromium } from "playwright";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 
 const URL = "https://museum-tickets.nintendo.com/en/calendar";
 const TOPIC = process.env.NTFY_TOPIC;
@@ -89,6 +89,7 @@ let failed = false;
 try {
   await page.goto(URL, { waitUntil: "networkidle", timeout: 60000 });
   const alerts = [];
+  const rows = [];
 
   for (const t of TARGETS) {
     await gotoMonth(page, t);
@@ -110,11 +111,20 @@ try {
     const info = await readDay(page, t.aria);
     if (!info) throw new Error(`${t.aria} 셀을 찾지 못함 (debug/ 확인)`);
     const status = classify(info);
+    rows.push(`| ${t.label} | ${status} |`);
     console.log(`${t.label} [${t.aria}] => ${status}`);
     console.log(`  tokens=${JSON.stringify(info.tokens)} text=${JSON.stringify(info.text)} alts=${JSON.stringify(info.alts)} href=${info.hasHref}`);
     console.log(`  html=${info.html}`);
     if (status === "available") alerts.push(`${t.label} 예약 가능!`);
     else if (status === "unknown") alerts.push(`${t.label} 상태 변화 감지(확인 필요): ${info.text.replace(/\s+/g, " ") || info.tokens.join(",")}`);
+  }
+
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    const kst = new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
+    appendFileSync(
+      process.env.GITHUB_STEP_SUMMARY,
+      `### 확인 시각: ${kst} (KST)\n\n| 날짜 | 상태 |\n|---|---|\n${rows.join("\n")}\n`,
+    );
   }
 
   if (process.env.TEST_NOTIFY === "true") await notify("Nintendo Museum test", "테스트 알림입니다");
