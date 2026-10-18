@@ -28,7 +28,7 @@ async function notify(title, message, priority = "default", tags = "ticket") {
 // FullCalendar 이벤트 영역의 내용(fc- 접두 클래스 제외)으로 상태 판정
 function classify(info) {
   const sig = [info.text, ...info.alts, ...info.srcs, ...info.tokens].join(" ").toLowerCase();
-  if (!sig.trim()) return "soldout"; // 이벤트 없음 = 표시 없음
+  if (!sig.trim()) return "empty"; // 표시 없음: 알림 없이 로그만 남김
   if (/[×✕✖╳]|closed|holiday|close\b/.test(sig)) return "closed";
   if (/[—–−－ー]|(^|\s)-(\s|$)|sold|dash|minus|none|\bng\b|full|unavail/.test(sig)) return "soldout";
   if (/[○◯〇]|avail|vacan|circle|\bok\b|\bopen\b|stock|reserve/.test(sig)) return "available";
@@ -89,7 +89,18 @@ try {
 
   for (const t of TARGETS) {
     await gotoMonth(page, t);
-    await page.waitForTimeout(500);
+    await page.waitForSelector(".fc-daygrid-event", { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const month = await page.$$eval("td.fc-day", (tds) =>
+      tds.map((td) => {
+        const lab = td.querySelector("a[aria-label]")?.getAttribute("aria-label") ?? "?";
+        const toks = [...td.querySelectorAll(".fc-daygrid-day-events *")]
+          .flatMap((e) => String(e.className?.baseVal ?? e.className ?? "").split(/\s+/))
+          .filter((c) => c && !c.startsWith("fc-"));
+        return `${lab.replace(/, \d{4}$/, "")}=${[...new Set(toks)].join("+") || "-"}`;
+      }),
+    );
+    console.log(`[${t.tab} 전체] ${month.join(" | ")}`);
     await page.screenshot({ path: `debug/${t.tab}.png`, fullPage: true });
     writeFileSync(`debug/${t.tab}.html`, await page.content());
 
