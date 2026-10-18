@@ -5,8 +5,8 @@ import { mkdirSync, writeFileSync } from "node:fs";
 const URL = "https://museum-tickets.nintendo.com/en/calendar";
 const TOPIC = process.env.NTFY_TOPIC;
 const TARGETS = [
-  { tab: "Oct", day: 31, label: "10/31" },
-  { tab: "Nov", day: 1, label: "11/1" },
+  { tab: "Oct", aria: "October 31, 2026", label: "10/31" },
+  { tab: "Nov", aria: "November 1, 2026", label: "11/1" },
 ];
 
 mkdirSync("debug", { recursive: true });
@@ -25,35 +25,58 @@ async function notify(title, message, priority = "default", tags = "ticket") {
   if (!res.ok) throw new Error(`ntfy 전송 실패: ${res.status}`);
 }
 
-// 셀 내용을 보고 상태 판정
+// FullCalendar 이벤트 영역의 내용(fc- 접두 클래스 제외)으로 상태 판정
 function classify(info) {
-  const sig = [info.rest, ...info.alts, ...info.srcs, ...info.classes].join(" ").toLowerCase();
+  const sig = [info.text, ...info.alts, ...info.srcs, ...info.tokens].join(" ").toLowerCase();
+  if (!sig.trim()) return "soldout"; // 이벤트 없음 = 표시 없음
   if (/[×✕✖╳]|closed|holiday|close\b/.test(sig)) return "closed";
-  if (/[—–−－ー]|(^|\s)-(\s|$)|sold|dash|minus|none|\bng\b/.test(sig)) return "soldout";
-  if (/[○◯〇]|avail|vacan|circle|\bok\b|\bopen\b/.test(sig)) return "available";
+  if (/[—–−－ー]|(^|\s)-(\s|$)|sold|dash|minus|none|\bng\b|full|unavail/.test(sig)) return "soldout";
+  if (/[○◯〇]|avail|vacan|circle|\bok\b|\bopen\b|stock|reserve/.test(sig)) return "available";
   return "unknown";
 }
 
-async function readDay(page, day) {
-  return page.evaluate((day) => {
-    let cells = [...document.querySelectorAll("td")];
-    if (!cells.length) cells = [...document.querySelectorAll("[role=gridcell], li")];
-    const hits = cells.filter(
-      (c) => (c.innerText || "").trim().split(/\s+/)[0] === String(day),
-    );
-    if (!hits.length) return null;
-    // 이전/다음 달의 흐린 날짜와 겹칠 수 있어서: 1~7일은 첫 번째, 그 외는 마지막 셀이 해당 월
-    const cell = day <= 7 ? hits[0] : hits[hits.length - 1];
-    const text = cell.innerText.trim();
+async function readDay(page, aria) {
+  return page.evaluate((aria) => {
+    const a = document.querySelector(`a[aria-label="${aria}"]`);
+    if (!a) return null;
+    const cell = a.closest("td") || a.parentElement;
+    const ev = cell.querySelector(".fc-daygrid-day-events") || cell;
+    const els = [...ev.querySelectorAll("*")];
+    const tokens = els
+      .flatMap((e) => String(e.className?.baseVal ?? e.className ?? "").split(/\s+/))
+      .filter((c) => c && !c.startsWith("fc-"));
     return {
-      text,
-      rest: text.split(/\s+/).slice(1).join(" "),
-      alts: [...cell.querySelectorAll("img")].map((i) => i.alt || ""),
-      srcs: [...cell.querySelectorAll("img")].map((i) => i.src.split("/").pop()),
-      classes: [cell, ...cell.querySelectorAll("*")].map((e) => e.className?.baseVal ?? e.className ?? "").filter(Boolean),
-      html: cell.innerHTML.slice(0, 500),
+      text: ev.innerText.trim(),
+      alts: [...ev.querySelectorAll("img")].map((i) => i.alt || ""),
+      srcs: [...ev.querySelectorAll("img")].map((i) => i.src.split("/").pop()),
+      tokens: [...new Set(tokens)],
+      hasHref: !!ev.querySelector("a[href]"),
+      html: ev.innerHTML.slice(0, 600),
     };
-  }, day);
+  }, aria);
+}
+
+async function gotoMonth(page, t) {
+  const sel = `a[aria-label="${t.aria}"]`;
+  if (await page.locator(sel).count()) return;
+  const strategies = [
+    () => page.getByText(new RegExp(`^\\s*${t.tab}\\b`)).first().click(),
+    () =>
+      page
+        .locator("button, a, li, div[role=tab]")
+        .filter({ hasText: new RegExp(`^\\s*${t.tab}\\b`) })
+        .last()
+        .click(),
+  ];
+  for (const click of strategies) {
+    try {
+      await click();
+      await page.waitForSelector(sel, { timeout: 15000 });
+      return;
+    } catch {}
+  }
+  const labels = await page.$$eval("a.fc-daygrid-day-number", (as) => as.slice(0, 3).map((a) => a.getAttribute("aria-label")));
+  throw new Error(`${t.tab} 탭 전환 실패. 현재 표시 중인 날짜 예: ${labels.join(" | ")}`);
 }
 
 const browser = await chromium.launch();
@@ -65,22 +88,19 @@ try {
   const alerts = [];
 
   for (const t of TARGETS) {
-    await page
-      .locator("button, a, li, div[role=tab]")
-      .filter({ hasText: new RegExp(`^\\s*${t.tab}\\b`) })
-      .last()
-      .click();
-    await page.waitForLoadState("networkidle");
-    await page.waitForTimeout(1000);
+    await gotoMonth(page, t);
+    await page.waitForTimeout(500);
     await page.screenshot({ path: `debug/${t.tab}.png`, fullPage: true });
     writeFileSync(`debug/${t.tab}.html`, await page.content());
 
-    const info = await readDay(page, t.day);
-    if (!info) throw new Error(`${t.tab} 탭에서 ${t.day}일 셀을 찾지 못함 (debug/ 확인)`);
+    const info = await readDay(page, t.aria);
+    if (!info) throw new Error(`${t.aria} 셀을 찾지 못함 (debug/ 확인)`);
     const status = classify(info);
-    console.log(`${t.label}: ${status}`, JSON.stringify(info));
+    console.log(`${t.label} [${t.aria}] => ${status}`);
+    console.log(`  tokens=${JSON.stringify(info.tokens)} text=${JSON.stringify(info.text)} alts=${JSON.stringify(info.alts)} href=${info.hasHref}`);
+    console.log(`  html=${info.html}`);
     if (status === "available") alerts.push(`${t.label} 예약 가능!`);
-    else if (status === "unknown") alerts.push(`${t.label} 상태 변화 감지(확인 필요): ${info.text.replace(/\s+/g, " ")}`);
+    else if (status === "unknown") alerts.push(`${t.label} 상태 변화 감지(확인 필요): ${info.text.replace(/\s+/g, " ") || info.tokens.join(",")}`);
   }
 
   if (process.env.TEST_NOTIFY === "true") await notify("Nintendo Museum test", "테스트 알림입니다");
